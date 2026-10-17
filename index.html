@@ -93,7 +93,8 @@ button:disabled{opacity:.45;cursor:default}
 }
 #bpmInput::-webkit-inner-spin-button,#bpmInput::-webkit-outer-spin-button{-webkit-appearance:none;margin:0}
 .status{font-size:15px;color:var(--muted);font-variant-numeric:tabular-nums;min-height:1.5em}
-.status.silent{color:var(--felt);font-weight:600}
+.status.silent,.status.lost{color:var(--felt);font-weight:600}
+.status.lost{max-width:34em;text-wrap:balance}
 
 .badges{display:flex;flex-wrap:wrap;justify-content:center;gap:6px}
 .badge{font-size:13px;line-height:1.3;padding:3px 10px;border-radius:999px;border:1px solid var(--brass);color:var(--brass);font-variant-numeric:tabular-nums}
@@ -255,6 +256,7 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;bac
 .msg{font-size:14px;color:var(--muted);margin:8px 0 0;min-height:1.2em}
 .confirm{display:grid;gap:10px;padding:12px 14px;margin-top:10px;border:1px solid var(--felt);border-radius:12px;font-size:15px}
 
+.version{font-size:12px;color:var(--muted);margin:-12px 0 0;font-variant-numeric:tabular-nums}
 .keyhelp{font-size:13px;color:var(--muted);margin:0}
 .keyhelp kbd{font-family:var(--f-ui);font-size:12px;border:1px solid var(--line);border-radius:5px;padding:1px 5px;background:var(--surface)}
 
@@ -365,6 +367,7 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;bac
       </div>
 
       <p class="keyhelp" data-th="keyhelp"></p>
+      <p class="version" id="appVersion"></p>
     </div>
 
     <!-- ===== Pieces ===== -->
@@ -451,6 +454,7 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;bac
 <script>
 (() => {
   'use strict';
+  const APP_VERSION = '1.2.1';   // 版本號：改這裡，build.py 也會用它更新離線快取
   const MIN = 20, MAX = 240, KEY = 'piano-metronome.v1';
   const TERMS = [[24,'Larghissimo'],[40,'Grave'],[60,'Largo'],[66,'Larghetto'],[76,'Adagio'],
                  [108,'Andante'],[120,'Moderato'],[156,'Allegro'],[176,'Vivace'],[200,'Presto'],[999,'Prestissimo']];
@@ -487,6 +491,9 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;bac
       hLog:'練習紀錄', today:'今天', week:'最近 7 天', emptyLog:'按「開始」練習 10 秒以上，就會自動記錄在這裡。',
       noPiece:'未指定曲目', deleted:'（已刪除的曲目）',
       dur:s=>{ const m=Math.round(s/60); if(s<60) return '不到 1 分'; return m>=60?`${Math.floor(m/60)} 小時 ${m%60} 分`:`${m} 分`; },
+      lost:'聲音被系統中斷了（可能是鎖屏、來電或其他 App 播放）。按「開始」繼續。',
+      volZero:'音量是 0', allMuted:'每一拍都設成靜音',
+      version:v=>`版本 ${v}`,
       hBackup:'備份', export:'匯出備份檔', import:'從備份檔匯入',
       exported:'已建立備份檔。', exportFail:'這裡無法存檔，請在加入主畫面的版本使用。',
       importAsk:(p,l)=>`備份裡有 ${p} 首曲目、${l} 筆練習紀錄。匯入會取代目前所有的曲目、紀錄和設定。`,
@@ -522,6 +529,9 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;bac
       hLog:'PRACTICE LOG', today:'Today', week:'Last 7 days', emptyLog:'Sessions of 10 seconds or more are logged here automatically.',
       noPiece:'No piece', deleted:'(deleted piece)',
       dur:s=>{ const m=Math.round(s/60); if(s<60) return '< 1 min'; return m>=60?`${Math.floor(m/60)} h ${m%60} min`:`${m} min`; },
+      lost:'The system interrupted the sound (screen lock, a call or another app). Press Start to continue.',
+      volZero:'Volume is 0', allMuted:'All beats are muted',
+      version:v=>`Version ${v}`,
       hBackup:'BACKUP', export:'Export backup file', import:'Import from backup',
       exported:'Backup file created.', exportFail:'Saving files does not work here. Use the Home Screen version.',
       importAsk:(p,l)=>`This backup has ${p} pieces and ${l} practice sessions. Importing replaces all current pieces, sessions and settings.`,
@@ -600,12 +610,21 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;bac
     return 'data:audio/wav;base64,' + btoa(bin);
   }
 
-  function ensureAudio() {
+  // iOS puts an AudioContext into "interrupted"/"suspended" after the screen locks, the app goes to the
+  // background, a call or Siri, another app playing audio, or headphones connecting. resume() then often
+  // fails, and sometimes a context reports "running" but outputs nothing after an audio route change.
+  // So every Start builds a fresh context inside the tap, and a stale one is never reused.
+  function ensureAudio(fresh) {
+    if (ctx && (fresh || ctx.state !== 'running')) {
+      const old = ctx; ctx = null;
+      try { old.onstatechange = null; old.close().catch(() => {}); } catch (e) {}
+    }
     if (!ctx) {
       // Let sound play even when the iPhone ring/silent switch is on (iOS 17+ / Safari 16.4+)
       try { if (navigator.audioSession) navigator.audioSession.type = 'playback'; } catch (e) {}
       const AC = window.AudioContext || window.webkitAudioContext;
       ctx = new AC({ latencyHint: 'interactive' });
+      ctx.onstatechange = onCtxState;
       master = ctx.createGain();
       master.gain.value = S.vol / 100;
       const comp = ctx.createDynamicsCompressor();
@@ -615,9 +634,9 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;bac
       noise = ctx.createBuffer(1, Math.floor(ctx.sampleRate * 0.04), ctx.sampleRate);
       const d = noise.getChannelData(0); for (let i = 0; i < d.length; i++) d[i] = Math.random() * 2 - 1;
       // Older iOS: a looping silent <audio> switches the session to "playback" so the silent switch is ignored
-      if (!navigator.audioSession) { try { silentEl = new Audio(silentWavURL()); silentEl.loop = true; } catch (e) {} }
+      if (!navigator.audioSession && !silentEl) { try { silentEl = new Audio(silentWavURL()); silentEl.loop = true; } catch (e) {} }
     }
-    if (ctx.state !== 'running') ctx.resume();
+    if (ctx.state !== 'running') ctx.resume().catch(() => {});
     const b = ctx.createBufferSource(); b.buffer = ctx.createBuffer(1, 1, 22050); b.connect(ctx.destination); b.start(0);
   }
 
@@ -672,10 +691,27 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;bac
     }
   }
 
+  // Watchdog: if the audio clock stops moving while we are playing, the system took the audio away.
+  let lastCtxTime = 0, lastMoved = 0;
   function scheduler() {
     if (!playing || !ctx) return;
+    const nowWall = performance.now();
+    if (ctx.currentTime !== lastCtxTime) { lastCtxTime = ctx.currentTime; lastMoved = nowWall; }
+    else if (nowWall - lastMoved > 1200) { audioLost(); return; }
     if (nextTime < ctx.currentTime - 0.2) nextTime = ctx.currentTime + 0.05; // resumed after an interruption: don't burst
     while (nextTime < ctx.currentTime + LOOKAHEAD) { scheduleNote(); advance(); }
+  }
+
+  function onCtxState() {
+    if (!playing || !ctx || ctx.state === 'running') return;
+    ctx.resume().catch(() => {});   // works for short interruptions; the watchdog handles the rest
+  }
+
+  let lostMsg = false;
+  function audioLost() {
+    if (!playing) return;
+    stop();
+    lostMsg = true; renderStatus();
   }
 
   const isSilentBar = barIdx => S.trainer.mute && (barIdx % (S.trainer.playBars + S.trainer.muteBars)) >= S.trainer.playBars;
@@ -737,8 +773,9 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;bac
   });
 
   function start() {
-    ensureAudio();
+    ensureAudio(true);
     if (silentEl) silentEl.play().catch(() => {});
+    lostMsg = false; lastCtxTime = ctx.currentTime; lastMoved = performance.now() + 800; // grace period while the context starts
     playing = true; beat = 0; sub = 0; schedBar = 0; dispBar = 0; queue = [];
     countLeft = S.countIn ? 1 : 0;
     reachedTarget = S.trainer.ramp && S.bpm >= rampTarget();
@@ -783,7 +820,8 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;bac
   function renderStatus() {
     const L = T();
     $status.classList.toggle('silent', playing && curState.silent);
-    if (!playing) { $status.textContent = L.idle; return; }
+    $status.classList.toggle('lost', !playing && lostMsg);
+    if (!playing) { $status.textContent = lostMsg ? L.lost : L.idle; return; }
     const main = curState.counting ? L.counting : curState.silent ? L.silentBar : L.bar(Math.max(1, dispBar));
     $status.textContent = `${main}　${mmss(Math.max(0, (performance.now() - startedAt) / 1000))}`;
   }
@@ -792,6 +830,8 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;bac
     const L = T(), tr = S.trainer, out = [];
     if (tr.ramp) out.push(`<span class="badge">${reachedTarget && playing ? L.reached + ' ♩' + rampTarget() : L.badgeRamp(tr.rampStep, tr.rampEvery, rampTarget())}</span>`);
     if (tr.mute) out.push(`<span class="badge rest">${L.badgeMute(tr.playBars, tr.muteBars)}</span>`);
+    if (S.vol === 0) out.push(`<span class="badge rest">${L.volZero}</span>`);
+    if (S.accents.every(a => a === 0)) out.push(`<span class="badge rest">${L.allMuted}</span>`);
     $badges.innerHTML = out.join('');
     $badges.hidden = !out.length;
   }
@@ -816,7 +856,7 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;bac
     k.dataset.level = S.accents[i];
     k.querySelector('.tag').textContent = S.beats <= 8 ? T().tags[S.accents[i]] : '';
     k.setAttribute('aria-label', T().beatLabel(i + 1, T().levels[S.accents[i]]));
-    syncPiece(); save();
+    syncPiece(); save(); renderBadges();
   });
 
   let activeKey = null;
@@ -876,7 +916,7 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;bac
     S.beats = Math.min(16, Math.max(1, b)); S.unit = u;
     S.accents = defaultAccents(S.beats, S.unit);
     if (beat >= S.beats) beat = 0;
-    clearActive(); renderSigs(); renderKeys(); syncPiece(); save();
+    clearActive(); renderSigs(); renderKeys(); syncPiece(); save(); renderBadges();
   }
   function setPressed(id, v) {
     document.querySelectorAll(`#${id} button`).forEach(b => b.setAttribute('aria-pressed', b.dataset.v === String(v)));
@@ -947,7 +987,7 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;bac
   $vol.addEventListener('input', () => {
     S.vol = +$vol.value;
     if (master) master.gain.setTargetAtTime(S.vol / 100, ctx.currentTime, 0.01);
-    save();
+    save(); renderBadges();
   });
   const $count = $('countIn');
   $count.addEventListener('change', () => { S.countIn = $count.checked; save(); });
@@ -1170,6 +1210,7 @@ input[type=range]::-moz-range-thumb{width:26px;height:26px;border-radius:50%;bac
     document.querySelectorAll('[data-ta]').forEach(el => { el.setAttribute('aria-label', L[el.dataset.ta]); });
     $tapInfo.textContent = L.tapIdle; taps = [];
     setPressed('langSeg', S.lang);
+    $('appVersion').textContent = L.version(APP_VERSION);
     renderKeys(); renderPlay(); renderStatus(); renderBadges(); renderPieces(); renderPieceBar(); renderLog();
     if (!$form.hidden) { $pfDel.textContent = delArmed ? L.delSure : L.del; }
   }

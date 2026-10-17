@@ -1,6 +1,6 @@
 // 鋼琴節拍器 Service Worker：把所有檔案存起來，沒有網路也能開。
 // 有網路時會在背景抓新版，下次開啟就會更新。
-const CACHE = 'piano-metronome-v2';
+const CACHE = 'piano-metronome-v1.2.1';
 const FILES = [
   './',
   './index.html',
